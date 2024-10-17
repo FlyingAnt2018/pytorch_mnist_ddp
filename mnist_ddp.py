@@ -10,26 +10,44 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 import torch.distributed as dist
 
+'''
+# 获取rank,每个进程都有自己的序号,各不相同
+torch.distributed.get_rank()
+
+# 获取local_rank。一般情况下,你需要用这个 local_rank 来手动设置当前模型是跑在当前机器的哪块GPU上面的。
+torch.distributed.local_rank()
+
+'''
 def init_distributed_mode(args):
     '''initilize DDP 
     '''
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        print("first branch")
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
         args.gpu = int(os.environ["LOCAL_RANK"])
+        print(args.rank)
+        print(args.world_size)
+        print(args.gpu)
     elif "SLURM_PROCID" in os.environ:
+        print("2")
         args.rank = int(os.environ["SLURM_PROCID"])
         args.gpu = args.rank % torch.cuda.device_count()
     elif hasattr(args, "rank"):
+        print("3")
         pass
     else:
+        print("4")
         print("Not using distributed mode")
         args.distributed = False
         return
 
     args.distributed = True
 
+    # 新增3：DDP backend初始化
+    #   a.根据local_rank来设定当前使用哪块GPU
     torch.cuda.set_device(args.gpu)
+    #   b.初始化DDP，使用默认backend(nccl)就行。如果是CPU模型运行，需要选择其他后端。
     args.dist_backend = "nccl"
     print(f"| distributed init (rank {args.rank}): {args.dist_url}, local rank:{args.gpu}, world size:{args.world_size}", flush=True)
     dist.init_process_group(
@@ -72,6 +90,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
         loss.backward()
         optimizer.step()
         if args.distributed:
+            # 获取rank，每个进程都有自己的序号，各不相同
             if dist.get_rank() == 0:
                 if batch_idx % args.log_interval == 0:
                     print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -128,7 +147,8 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
-
+    # 后面的这三个参数系统会自动设置
+    # 新增2：从外面得到local_rank参数，在调用DDP的时候，其会自动给出这个参数，后面还会介绍。
     parser.add_argument('--local_rank', type=int, help='local rank, will passed by ddp')
     parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--dist-url", default="env://", type=str, help="url used to set up distributed training")
@@ -159,14 +179,16 @@ def main():
     dataset_val = datasets.MNIST('./data', train=False,
                        transform=transform)
     if args.distributed:
+        # 新增1：使用DistributedSampler，DDP帮我们把细节都封装起来了。
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train, shuffle=True)
     else:
         train_sampler = torch.utils.data.RandomSampler(dataset_train)
     test_sampler = torch.utils.data.SequentialSampler(dataset_val)
-
+    # 需要注意的是，这里的batch_size指的是每个进程下的batch_size。也就是说，总batch_size是这里的batch_size再乘以并行数(world_size)。
     train_loader = torch.utils.data.DataLoader(dataset_train, sampler = train_sampler, **train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset_val, sampler = test_sampler, **test_kwargs)
-
+    
+    # 新增4：定义并把模型放置到单独的GPU上，需要在调用`model=DDP(model)`前做哦。
     model = Net().to(device)
     model_without_ddp = model
     if args.distributed:
@@ -178,7 +200,9 @@ def main():
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(1, args.epochs + 1):
         if args.distributed:
+            # 新增2：设置sampler的epoch，DistributedSampler需要这个来维持各个进程之间的相同随机数种子
             train_sampler.set_epoch(epoch)
+        # 后面这部分，则与原来完全一致了。
         train(args, model, device, train_loader, optimizer, epoch)
         if args.distributed:
             # Only run validation on GPU 0 process, for simplity, so we do not run validation on multi gpu. 
@@ -190,6 +214,9 @@ def main():
 
     if args.save_model:
         if args.distributed:
+            # 1. save模型的时候，和DP模式一样，有一个需要注意的点：保存的是model.module而不是model。
+            #    因为model其实是DDP model，参数是被`model=DDP(model)`包起来的。
+            # 2. 我只需要在进程0上保存一次就行了，避免多次保存重复的东西。
             if dist.get_rank() == 0:
                 # only save model on GPU0 process.
                 torch.save(model.state_dict(), f"mnist_cnn.pt")
